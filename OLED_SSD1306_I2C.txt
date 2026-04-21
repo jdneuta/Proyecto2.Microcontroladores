@@ -1,0 +1,248 @@
+/*=========================================================
+ * PIC18F4550 - Display OLED SSD1306 via I2C
+ * Proyecto:    Interfaz visual con pantalla 128x64
+ * Protocolo:   I2C (SSP module) - 100kHz
+ * Direccion:   0x78 (write)
+ *
+ * Conexiones:
+ *   SDA -> RB0
+ *   SCL -> RB1
+ *   Pull-ups 4.7k a VCC requeridos
+ *
+ * Entorno: MPLAB X + XC8 | Oscilador interno 8MHz
+ *=========================================================*/
+
+#pragma config FOSC   = INTOSC_EC
+#pragma config WDT    = OFF
+#pragma config LVP    = OFF
+#pragma config PBADEN = OFF
+#pragma config MCLRE  = OFF
+#pragma config XINST  = OFF
+#pragma config PWRT   = ON
+#pragma config DEBUG  = OFF
+
+#include <xc.h>
+#define _XTAL_FREQ 8000000
+
+/*--- Configuracion del display ---*/
+#define DISPLAY_ADDR    0x78    /* Direccion I2C (escritura) */
+#define CTRL_CMD        0x00    /* Byte control: comando     */
+#define CTRL_DATA       0x40    /* Byte control: dato/pixel  */
+
+/*--- Velocidad I2C ---
+ * BRG = (Fosc / (4 * fscl)) - 1
+ * BRG = (8MHz  / (4 * 100kHz)) - 1 = 19 */
+#define BRG_VAL         19
+
+/*=========================================================
+ * CAPA I2C
+ *=========================================================*/
+
+static void bus_esperar(void){
+    while(SSPSTATbits.BF || (SSPCON2 & 0x1F));
+    __delay_us(5);
+}
+
+static void bus_inicio(unsigned char direccion){
+    bus_esperar();
+    SSPCON2bits.SEN = 1;
+    while(SSPCON2bits.SEN);
+    SSPBUF = direccion;
+    while(!PIR1bits.SSPIF);
+    PIR1bits.SSPIF = 0;
+}
+
+static void bus_enviar(unsigned char byte){
+    bus_esperar();
+    SSPBUF = byte;
+    while(!PIR1bits.SSPIF);
+    PIR1bits.SSPIF = 0;
+}
+
+static void bus_fin(void){
+    bus_esperar();
+    SSPCON2bits.PEN = 1;
+    while(SSPCON2bits.PEN);
+    PIR1bits.SSPIF = 0;
+}
+
+void bus_init(void){
+    TRISBbits.TRISB0 = 1;   /* SDA: entrada */
+    TRISBbits.TRISB1 = 1;   /* SCL: entrada */
+
+    SSPSTAT  = 0x80;        /* Slew rate OFF              */
+    SSPCON1  = 0x28;        /* Master I2C, SSPEN activo   */
+    SSPCON2  = 0x00;
+    SSPADD   = BRG_VAL;
+    PIR1bits.SSPIF = 0;
+}
+
+/*=========================================================
+ * CAPA SSD1306
+ *=========================================================*/
+
+static void display_cmd(unsigned char c){
+    bus_inicio(DISPLAY_ADDR);
+    bus_enviar(CTRL_CMD);
+    bus_enviar(c);
+    bus_fin();
+}
+
+static void display_pixel(unsigned char d){
+    bus_inicio(DISPLAY_ADDR);
+    bus_enviar(CTRL_DATA);
+    bus_enviar(d);
+    bus_fin();
+}
+
+void display_borrar(void){
+    unsigned char pg, col;
+    for(pg = 0; pg < 8; pg++){
+        display_cmd(0xB0 | pg);
+        display_cmd(0x00);
+        display_cmd(0x10);
+        for(col = 0; col < 128; col++)
+            display_pixel(0x00);
+    }
+}
+
+void display_cursor(unsigned char pg, unsigned char col){
+    display_cmd(0xB0 | pg);
+    display_cmd(col & 0x0F);
+    display_cmd(0x10 | ((col >> 4) & 0x0F));
+}
+
+void display_init(void){
+    __delay_ms(100);
+
+    display_cmd(0xAE);  /* Apagar display            */
+    display_cmd(0xD5);  /* Clock / divisor           */
+    display_cmd(0x80);
+    display_cmd(0xA8);  /* Multiplex                 */
+    display_cmd(0x3F);  /* 64 lineas                 */
+    display_cmd(0xD3);  /* Offset vertical           */
+    display_cmd(0x00);
+    display_cmd(0x40);  /* Linea de inicio = 0       */
+    display_cmd(0x8D);  /* Charge pump               */
+    display_cmd(0x14);  /* Habilitar                 */
+    display_cmd(0x20);  /* Modo de direccionamiento  */
+    display_cmd(0x00);  /* Horizontal                */
+    display_cmd(0xA1);  /* SEG remap normal          */
+    display_cmd(0xC8);  /* COM scan direction        */
+    display_cmd(0xDA);  /* COM pins config           */
+    display_cmd(0x12);
+    display_cmd(0x81);  /* Contraste                 */
+    display_cmd(0xCF);
+    display_cmd(0xD9);  /* Pre-charge period         */
+    display_cmd(0xF1);
+    display_cmd(0xDB);  /* VCOMH                     */
+    display_cmd(0x40);
+    display_cmd(0xA4);  /* Contenido desde RAM       */
+    display_cmd(0xA6);  /* Modo normal (no invertido)*/
+    display_cmd(0xAF);  /* Encender display          */
+
+    __delay_ms(10);
+    display_borrar();
+}
+
+/*=========================================================
+ * FUENTE 5x8 (ASCII 32-90)
+ * 5 columnas de 8 bits por caracter
+ *=========================================================*/
+static const unsigned char FUENTE[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, /* SP */
+    {0x00,0x00,0x5F,0x00,0x00}, /* !  */
+    {0x00,0x07,0x00,0x07,0x00}, /* "  */
+    {0x14,0x7F,0x14,0x7F,0x14}, /* #  */
+    {0x24,0x2A,0x7F,0x2A,0x12}, /* $  */
+    {0x23,0x13,0x08,0x64,0x62}, /* %  */
+    {0x36,0x49,0x55,0x22,0x50}, /* &  */
+    {0x00,0x05,0x03,0x00,0x00}, /* '  */
+    {0x00,0x1C,0x22,0x41,0x00}, /* (  */
+    {0x00,0x41,0x22,0x1C,0x00}, /* )  */
+    {0x08,0x2A,0x1C,0x2A,0x08}, /* *  */
+    {0x08,0x08,0x3E,0x08,0x08}, /* +  */
+    {0x00,0x50,0x30,0x00,0x00}, /* ,  */
+    {0x08,0x08,0x08,0x08,0x08}, /* -  */
+    {0x00,0x60,0x60,0x00,0x00}, /* .  */
+    {0x20,0x10,0x08,0x04,0x02}, /* /  */
+    {0x3E,0x51,0x49,0x45,0x3E}, /* 0  */
+    {0x00,0x42,0x7F,0x40,0x00}, /* 1  */
+    {0x42,0x61,0x51,0x49,0x46}, /* 2  */
+    {0x21,0x41,0x45,0x4B,0x31}, /* 3  */
+    {0x18,0x14,0x12,0x7F,0x10}, /* 4  */
+    {0x27,0x45,0x45,0x45,0x39}, /* 5  */
+    {0x3C,0x4A,0x49,0x49,0x30}, /* 6  */
+    {0x01,0x71,0x09,0x05,0x03}, /* 7  */
+    {0x36,0x49,0x49,0x49,0x36}, /* 8  */
+    {0x06,0x49,0x49,0x29,0x1E}, /* 9  */
+    {0x00,0x36,0x36,0x00,0x00}, /* :  */
+    {0x00,0x56,0x36,0x00,0x00}, /* ;  */
+    {0x00,0x08,0x14,0x22,0x41}, /* <  */
+    {0x14,0x14,0x14,0x14,0x14}, /* =  */
+    {0x41,0x22,0x14,0x08,0x00}, /* >  */
+    {0x02,0x01,0x51,0x09,0x06}, /* ?  */
+    {0x32,0x49,0x79,0x41,0x3E}, /* @  */
+    {0x7E,0x11,0x11,0x11,0x7E}, /* A  */
+    {0x7F,0x49,0x49,0x49,0x36}, /* B  */
+    {0x3E,0x41,0x41,0x41,0x22}, /* C  */
+    {0x7F,0x41,0x41,0x22,0x1C}, /* D  */
+    {0x7F,0x49,0x49,0x49,0x41}, /* E  */
+    {0x7F,0x09,0x09,0x09,0x01}, /* F  */
+    {0x3E,0x41,0x49,0x49,0x7A}, /* G  */
+    {0x7F,0x08,0x08,0x08,0x7F}, /* H  */
+    {0x00,0x41,0x7F,0x41,0x00}, /* I  */
+    {0x20,0x40,0x41,0x3F,0x01}, /* J  */
+    {0x7F,0x08,0x14,0x22,0x41}, /* K  */
+    {0x7F,0x40,0x40,0x40,0x40}, /* L  */
+    {0x7F,0x02,0x04,0x02,0x7F}, /* M  */
+    {0x7F,0x04,0x08,0x10,0x7F}, /* N  */
+    {0x3E,0x41,0x41,0x41,0x3E}, /* O  */
+    {0x7F,0x09,0x09,0x09,0x06}, /* P  */
+    {0x3E,0x41,0x51,0x21,0x5E}, /* Q  */
+    {0x7F,0x09,0x19,0x29,0x46}, /* R  */
+    {0x46,0x49,0x49,0x49,0x31}, /* S  */
+    {0x01,0x01,0x7F,0x01,0x01}, /* T  */
+    {0x3F,0x40,0x40,0x40,0x3F}, /* U  */
+    {0x1F,0x20,0x40,0x20,0x1F}, /* V  */
+    {0x3F,0x40,0x38,0x40,0x3F}, /* W  */
+    {0x63,0x14,0x08,0x14,0x63}, /* X  */
+    {0x07,0x08,0x70,0x08,0x07}, /* Y  */
+    {0x61,0x51,0x49,0x45,0x43}, /* Z  */
+};
+
+static void escribir_char(unsigned char c){
+    unsigned char k;
+    if(c < 32 || c > 90) c = 32;
+    for(k = 0; k < 5; k++)
+        display_pixel(FUENTE[c - 32][k]);
+    display_pixel(0x00);        /* Separador entre caracteres */
+}
+
+void escribir_texto(unsigned char pg, unsigned char col,
+                    const char *msg){
+    display_cursor(pg, col);
+    while(*msg)
+        escribir_char(*msg++);
+}
+
+/*=========================================================
+ * PROGRAMA PRINCIPAL
+ *=========================================================*/
+void main(void){
+
+    OSCCON = 0x72;      /* Oscilador interno a 8MHz   */
+    ADCON1 = 0x0F;      /* Puerto B completamente digital */
+
+    bus_init();         /* Iniciar modulo I2C         */
+    display_init();     /* Iniciar pantalla OLED      */
+
+    /* Contenido en pantalla
+     * Rango de paginas: 0-7  |  Columnas: 0-127       */
+    escribir_texto(0, 0, "Display OLED SSD1306 via I2C ");
+    escribir_texto(2, 0, "...");
+    escribir_texto(4, 0, "PIC18F4550");
+    escribir_texto(6, 0, "...");
+
+    for(;;);            /* Loop infinito              */
+}
