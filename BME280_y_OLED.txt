@@ -1,0 +1,510 @@
+/*=========================================================
+ * PIC18F4550 - BME280 + Display OLED SSD1306 via I2C
+ * Proyecto:    Lectura de Temperatura y Humedad
+ * Sensores:    BME280 (0x76) + OLED 128x64 (0x78)
+ * Protocolo:   I2C (SSP module) - 100kHz
+ *
+ * Conexiones:
+ *   SDA -> RB0  |  SCL -> RB1
+ *   Pull-ups 4.7k a VCC requeridos en SDA y SCL
+ *   BME280: SDO a GND -> direccion 0x76
+ *
+ * Entorno: MPLAB X + XC8 | Oscilador interno 8MHz
+ *
+ * NOTA BME280 - Lectura por I2C:
+ *   1. Leer registros de calibracion (fabrica)
+ *   2. Leer datos crudos (ADC)
+ *   3. Aplicar formulas de compensacion del datasheet
+ *      para obtener valores reales de T y HR
+ *=========================================================*/
+
+#pragma config FOSC   = INTOSC_EC
+#pragma config WDT    = OFF
+#pragma config LVP    = OFF
+#pragma config PBADEN = OFF
+#pragma config MCLRE  = OFF
+#pragma config XINST  = OFF
+#pragma config PWRT   = ON
+#pragma config DEBUG  = OFF
+
+#include <xc.h>
+#define _XTAL_FREQ 8000000
+
+/*--- Display OLED SSD1306 ---*/
+#define DISPLAY_ADDR    0x78
+#define CTRL_CMD        0x00
+#define CTRL_DATA       0x40
+
+/*--- Sensor BME280 ---
+ * SDO a GND => direccion 0x76 (write = 0xEC)
+ * SDO a VCC => direccion 0x77 (write = 0xEE)  */
+#define BME280_ADDR     0xEC    /* 0x76 << 1 */
+
+/*--- Registros BME280 ---*/
+#define BME_REG_ID      0xD0    /* Chip ID, debe retornar 0x60 */
+#define BME_REG_RESET   0xE0
+#define BME_REG_CTRL_H  0xF2    /* Oversampling humedad        */
+#define BME_REG_CTRL_M  0xF4    /* Oversampling T/P + modo     */
+#define BME_REG_CONFIG  0xF5    /* Standby + filtro            */
+#define BME_REG_DATA    0xF7    /* Inicio bloque datos ADC     */
+#define BME_REG_CAL1    0x88    /* Inicio calibracion T y P    */
+#define BME_REG_CAL2    0xE1    /* Inicio calibracion H (parte 2) */
+
+/*--- Velocidad I2C ---
+ * BRG = (Fosc / (4 * fscl)) - 1 = 19  */
+#define BRG_VAL         19
+
+/*=========================================================
+ * VARIABLES GLOBALES - Coeficientes de calibracion BME280
+ * Cada sensor tiene valores unicos grabados en fabrica.
+ * Se leen una sola vez al inicio.
+ *=========================================================*/
+static unsigned int  cal_T1;
+static signed int    cal_T2, cal_T3;
+
+static unsigned char cal_H1;
+static signed int    cal_H2;
+static unsigned char cal_H3;
+static signed int    cal_H4, cal_H5;
+static signed char   cal_H6;
+
+/* Variable compartida entre compensacion T y H */
+static signed long   t_fino;
+
+/*=========================================================
+ * CAPA I2C - Igual que el proyecto OLED
+ *=========================================================*/
+
+static void bus_esperar(void){
+    while(SSPSTATbits.BF || (SSPCON2 & 0x1F));
+    __delay_us(5);
+}
+
+static void bus_inicio(unsigned char direccion){
+    bus_esperar();
+    SSPCON2bits.SEN = 1;
+    while(SSPCON2bits.SEN);
+    SSPBUF = direccion;
+    while(!PIR1bits.SSPIF);
+    PIR1bits.SSPIF = 0;
+}
+
+static void bus_enviar(unsigned char byte){
+    bus_esperar();
+    SSPBUF = byte;
+    while(!PIR1bits.SSPIF);
+    PIR1bits.SSPIF = 0;
+}
+
+/* Lectura con ACK: hay mas bytes por venir */
+static unsigned char bus_leer_ack(void){
+    bus_esperar();
+    SSPCON2bits.RCEN = 1;           /* Habilito recepcion       */
+    while(!SSPSTATbits.BF);         /* Espero byte completo     */
+    SSPCON2bits.ACKEN = 1;          /* Envio ACK al esclavo     */
+    while(SSPCON2bits.ACKEN);
+    return SSPBUF;
+}
+
+/* Lectura con NACK: ultimo byte de la transaccion */
+static unsigned char bus_leer_nack(void){
+    bus_esperar();
+    SSPCON2bits.RCEN = 1;
+    while(!SSPSTATbits.BF);
+    SSPCON2bits.ACKDT  = 1;         /* NACK                     */
+    SSPCON2bits.ACKEN  = 1;
+    while(SSPCON2bits.ACKEN);
+    SSPCON2bits.ACKDT  = 0;         /* Restauro para proxima    */
+    return SSPBUF;
+}
+
+static void bus_fin(void){
+    bus_esperar();
+    SSPCON2bits.PEN = 1;
+    while(SSPCON2bits.PEN);
+    PIR1bits.SSPIF = 0;
+}
+
+void bus_init(void){
+    TRISBbits.TRISB0 = 1;
+    TRISBbits.TRISB1 = 1;
+    SSPSTAT  = 0x80;
+    SSPCON1  = 0x28;
+    SSPCON2  = 0x00;
+    SSPADD   = BRG_VAL;
+    PIR1bits.SSPIF = 0;
+}
+
+/*=========================================================
+ * CAPA BME280
+ *=========================================================*/
+
+/* Escribe un byte en un registro del BME280 */
+static void bme_escribir_reg(unsigned char reg, unsigned char valor){
+    bus_inicio(BME280_ADDR);        /* START + direccion write  */
+    bus_enviar(reg);                /* Registro destino         */
+    bus_enviar(valor);              /* Valor a escribir         */
+    bus_fin();
+}
+
+/* Lee un byte desde un registro del BME280 */
+static unsigned char bme_leer_reg(unsigned char reg){
+    unsigned char dato;
+    bus_inicio(BME280_ADDR);        /* START + direccion write  */
+    bus_enviar(reg);                /* Apunto al registro       */
+    bus_fin();
+    bus_inicio(BME280_ADDR | 0x01); /* START + direccion read   */
+    dato = bus_leer_nack();         /* Leo unico byte           */
+    bus_fin();
+    return dato;
+}
+
+/* Lee N bytes consecutivos desde un registro (burst read)
+ * El BME280 incrementa el puntero automaticamente.
+ * buf: arreglo donde se guardan los bytes leidos           */
+static void bme_leer_burst(unsigned char reg,
+                            unsigned char *buf,
+                            unsigned char n){
+    unsigned char i;
+    bus_inicio(BME280_ADDR);
+    bus_enviar(reg);
+    bus_fin();
+    bus_inicio(BME280_ADDR | 0x01);
+    for(i = 0; i < n - 1; i++)
+        buf[i] = bus_leer_ack();    /* ACK: sigue leyendo       */
+    buf[n - 1] = bus_leer_nack();   /* NACK: ultimo byte        */
+    bus_fin();
+}
+
+/* Carga los coeficientes de calibracion desde la EEPROM
+ * interna del BME280. Se llama una sola vez en el inicio. */
+static void bme_leer_calibracion(void){
+    unsigned char raw[26];
+
+    /* --- Bloque 1: registros 0x88 a 0x9F (T1-T3, P1-P9) --- */
+    bme_leer_burst(BME_REG_CAL1, raw, 26);
+
+    cal_T1 = (unsigned int) ((raw[1]  << 8) | raw[0]);
+    cal_T2 = (signed int)   ((raw[3]  << 8) | raw[2]);
+    cal_T3 = (signed int)   ((raw[5]  << 8) | raw[4]);
+    /* P1-P9 no se usan (no medimos presion) */
+
+    /* H1 esta en registro separado 0xA1 */
+    cal_H1 = bme_leer_reg(0xA1);
+
+    /* --- Bloque 2: registros 0xE1 a 0xE7 (H2-H6) --- */
+    bme_leer_burst(BME_REG_CAL2, raw, 7);
+
+    cal_H2 = (signed int)  ((raw[1] << 8) | raw[0]);
+    cal_H3 = raw[2];
+    cal_H4 = (signed int)  ((raw[3] << 4) | (raw[4] & 0x0F));
+    cal_H5 = (signed int)  ((raw[5] << 4) | (raw[4] >> 4));
+    cal_H6 = (signed char)  raw[6];
+}
+
+/* Configura el BME280 en modo normal con oversampling x1
+ * para temperatura y humedad.
+ * Modo normal: mide continuamente con el standby time
+ * configurado (aqui 1000ms entre mediciones).             */
+static void bme_configurar(void){
+    /* Primero humedad (CTRL_HUM debe escribirse antes de CTRL_MEAS) */
+    bme_escribir_reg(BME_REG_CTRL_H, 0x01); /* Humedad: osrs_h = x1  */
+
+    /* Temperatura x1, presion OFF, modo normal */
+    bme_escribir_reg(BME_REG_CTRL_M, 0x23); /* 0x23 = 00 100 011
+                                              * osrs_t=001 osrs_p=000
+                                              * mode=11 (normal)      */
+
+    /* Standby 1000ms, filtro OFF */
+    bme_escribir_reg(BME_REG_CONFIG, 0xA0); /* t_sb=101 (1000ms)     */
+}
+
+/*=========================================================
+ * FORMULAS DE COMPENSACION - Segun datasheet BME280
+ * Seccion 4.2.3 "Compensation formulas in double precision"
+ * Adaptadas a enteros de 32 bits para XC8
+ *=========================================================*/
+
+/* Retorna temperatura en centesimas de grado Celsius
+ * Ejemplo: 2315 = 23.15 C
+ * Tambien calcula t_fino, necesario para compensar humedad */
+static signed long bme_compensar_temp(signed long adc_T){
+    signed long var1, var2, T;
+
+    var1 = ((((adc_T >> 3) - ((signed long)cal_T1 << 1)))
+             * ((signed long)cal_T2)) >> 11;
+
+    var2 = (((((adc_T >> 4) - ((signed long)cal_T1))
+              * ((adc_T >> 4) - ((signed long)cal_T1))) >> 12)
+             * ((signed long)cal_T3)) >> 14;
+
+    t_fino = var1 + var2;
+    T = (t_fino * 5 + 128) >> 8;   /* En centesimas de grado   */
+    return T;
+}
+
+/* Retorna humedad relativa en formato Q22.10
+ * Para obtener %RH: dividir el resultado entre 1024
+ * Ejemplo: resultado=51200 -> 51200/1024 = 50.0 %RH         */
+static unsigned long bme_compensar_hum(signed long adc_H){
+    signed long v_x1;
+
+    v_x1  = t_fino - 76800L;
+    v_x1  = (((((adc_H << 14) - ((signed long)cal_H4 << 20)
+               - ((signed long)cal_H5 * v_x1)) + 16384L) >> 15)
+             * (((((((v_x1 * (signed long)cal_H6) >> 10)
+                  * (((v_x1 * (signed long)cal_H3) >> 11) + 32768L))
+                 >> 10) + 2097152L)
+               * (signed long)cal_H2 + 8192L) >> 14));
+
+    v_x1  = v_x1 - (((((v_x1 >> 15) * (v_x1 >> 15)) >> 7)
+                      * (signed long)cal_H1) >> 4);
+
+    if(v_x1 < 0)        v_x1 = 0;
+    if(v_x1 > 419430400L) v_x1 = 419430400L;
+
+    return (unsigned long)(v_x1 >> 12);
+}
+
+/* Lee los registros de datos crudos y aplica compensacion.
+ * Los resultados se guardan en las variables de salida:
+ *   *temp_c  : temperatura en centesimas de C (ej: 2315)
+ *   *hum_pct : humedad en decimas de % (ej: 502 = 50.2%)   */
+void bme_leer(signed long *temp_c, unsigned int *hum_pct){
+    unsigned char raw[8];
+    signed long   adc_T, adc_H;
+    unsigned long hum_q;
+
+    /* Registros 0xF7-0xFE: pres(3), temp(3), hum(2) */
+    bme_leer_burst(BME_REG_DATA, raw, 8);
+
+    /* Temperatura: bytes raw[3], raw[4], raw[5]
+     * Los 4 bits menos significativos de raw[5] no se usan */
+    adc_T = ((signed long)raw[3] << 12)
+           | ((signed long)raw[4] <<  4)
+           | ((signed long)raw[5] >>  4);
+
+    /* Humedad: bytes raw[6] y raw[7] */
+    adc_H = ((signed long)raw[6] << 8) | raw[7];
+
+    *temp_c  = bme_compensar_temp(adc_T);
+    hum_q    = bme_compensar_hum(adc_H);
+
+    /* Convierto Q22.10 a decimas de % : (val * 10) / 1024  */
+    *hum_pct = (unsigned int)((hum_q * 10UL) >> 10);
+}
+
+/*=========================================================
+ * INICIALIZACION BME280
+ *=========================================================*/
+void bme_init(void){
+    __delay_ms(10);                     /* Estabilizacion        */
+    bme_leer_calibracion();             /* Cargo coeficientes    */
+    bme_configurar();                   /* Modo normal, osrs x1  */
+    __delay_ms(100);                    /* Primera medicion lista*/
+}
+
+/*=========================================================
+ * CAPA OLED - Identica al proyecto anterior
+ *=========================================================*/
+
+static void display_cmd(unsigned char c){
+    bus_inicio(DISPLAY_ADDR);
+    bus_enviar(CTRL_CMD);
+    bus_enviar(c);
+    bus_fin();
+}
+
+static void display_pixel(unsigned char d){
+    bus_inicio(DISPLAY_ADDR);
+    bus_enviar(CTRL_DATA);
+    bus_enviar(d);
+    bus_fin();
+}
+
+void display_borrar(void){
+    unsigned char pg, col;
+    for(pg = 0; pg < 8; pg++){
+        display_cmd(0xB0 | pg);
+        display_cmd(0x00);
+        display_cmd(0x10);
+        for(col = 0; col < 128; col++)
+            display_pixel(0x00);
+    }
+}
+
+void display_cursor(unsigned char pg, unsigned char col){
+    display_cmd(0xB0 | pg);
+    display_cmd(col & 0x0F);
+    display_cmd(0x10 | ((col >> 4) & 0x0F));
+}
+
+void display_init(void){
+    __delay_ms(100);
+    display_cmd(0xAE);
+    display_cmd(0xD5); display_cmd(0x80);
+    display_cmd(0xA8); display_cmd(0x3F);
+    display_cmd(0xD3); display_cmd(0x00);
+    display_cmd(0x40);
+    display_cmd(0x8D); display_cmd(0x14);
+    display_cmd(0x20); display_cmd(0x00);
+    display_cmd(0xA1);
+    display_cmd(0xC8);
+    display_cmd(0xDA); display_cmd(0x12);
+    display_cmd(0x81); display_cmd(0xCF);
+    display_cmd(0xD9); display_cmd(0xF1);
+    display_cmd(0xDB); display_cmd(0x40);
+    display_cmd(0xA4);
+    display_cmd(0xA6);
+    display_cmd(0xAF);
+    __delay_ms(10);
+    display_borrar();
+}
+
+static const unsigned char FUENTE[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, /* SP */
+    {0x00,0x00,0x5F,0x00,0x00}, /* !  */
+    {0x00,0x07,0x00,0x07,0x00}, /* "  */
+    {0x14,0x7F,0x14,0x7F,0x14}, /* #  */
+    {0x24,0x2A,0x7F,0x2A,0x12}, /* $  */
+    {0x23,0x13,0x08,0x64,0x62}, /* %  */
+    {0x36,0x49,0x55,0x22,0x50}, /* &  */
+    {0x00,0x05,0x03,0x00,0x00}, /* '  */
+    {0x00,0x1C,0x22,0x41,0x00}, /* (  */
+    {0x00,0x41,0x22,0x1C,0x00}, /* )  */
+    {0x08,0x2A,0x1C,0x2A,0x08}, /* *  */
+    {0x08,0x08,0x3E,0x08,0x08}, /* +  */
+    {0x00,0x50,0x30,0x00,0x00}, /* ,  */
+    {0x08,0x08,0x08,0x08,0x08}, /* -  */
+    {0x00,0x60,0x60,0x00,0x00}, /* .  */
+    {0x20,0x10,0x08,0x04,0x02}, /* /  */
+    {0x3E,0x51,0x49,0x45,0x3E}, /* 0  */
+    {0x00,0x42,0x7F,0x40,0x00}, /* 1  */
+    {0x42,0x61,0x51,0x49,0x46}, /* 2  */
+    {0x21,0x41,0x45,0x4B,0x31}, /* 3  */
+    {0x18,0x14,0x12,0x7F,0x10}, /* 4  */
+    {0x27,0x45,0x45,0x45,0x39}, /* 5  */
+    {0x3C,0x4A,0x49,0x49,0x30}, /* 6  */
+    {0x01,0x71,0x09,0x05,0x03}, /* 7  */
+    {0x36,0x49,0x49,0x49,0x36}, /* 8  */
+    {0x06,0x49,0x49,0x29,0x1E}, /* 9  */
+    {0x00,0x36,0x36,0x00,0x00}, /* :  */
+    {0x00,0x56,0x36,0x00,0x00}, /* ;  */
+    {0x00,0x08,0x14,0x22,0x41}, /* <  */
+    {0x14,0x14,0x14,0x14,0x14}, /* =  */
+    {0x41,0x22,0x14,0x08,0x00}, /* >  */
+    {0x02,0x01,0x51,0x09,0x06}, /* ?  */
+    {0x32,0x49,0x79,0x41,0x3E}, /* @  */
+    {0x7E,0x11,0x11,0x11,0x7E}, /* A  */
+    {0x7F,0x49,0x49,0x49,0x36}, /* B  */
+    {0x3E,0x41,0x41,0x41,0x22}, /* C  */
+    {0x7F,0x41,0x41,0x22,0x1C}, /* D  */
+    {0x7F,0x49,0x49,0x49,0x41}, /* E  */
+    {0x7F,0x09,0x09,0x09,0x01}, /* F  */
+    {0x3E,0x41,0x49,0x49,0x7A}, /* G  */
+    {0x7F,0x08,0x08,0x08,0x7F}, /* H  */
+    {0x00,0x41,0x7F,0x41,0x00}, /* I  */
+    {0x20,0x40,0x41,0x3F,0x01}, /* J  */
+    {0x7F,0x08,0x14,0x22,0x41}, /* K  */
+    {0x7F,0x40,0x40,0x40,0x40}, /* L  */
+    {0x7F,0x02,0x04,0x02,0x7F}, /* M  */
+    {0x7F,0x04,0x08,0x10,0x7F}, /* N  */
+    {0x3E,0x41,0x41,0x41,0x3E}, /* O  */
+    {0x7F,0x09,0x09,0x09,0x06}, /* P  */
+    {0x3E,0x41,0x51,0x21,0x5E}, /* Q  */
+    {0x7F,0x09,0x19,0x29,0x46}, /* R  */
+    {0x46,0x49,0x49,0x49,0x31}, /* S  */
+    {0x01,0x01,0x7F,0x01,0x01}, /* T  */
+    {0x3F,0x40,0x40,0x40,0x3F}, /* U  */
+    {0x1F,0x20,0x40,0x20,0x1F}, /* V  */
+    {0x3F,0x40,0x38,0x40,0x3F}, /* W  */
+    {0x63,0x14,0x08,0x14,0x63}, /* X  */
+    {0x07,0x08,0x70,0x08,0x07}, /* Y  */
+    {0x61,0x51,0x49,0x45,0x43}, /* Z  */
+};
+
+static void escribir_char(unsigned char c){
+    unsigned char k;
+    if(c < 32 || c > 90) c = 32;
+    for(k = 0; k < 5; k++)
+        display_pixel(FUENTE[c - 32][k]);
+    display_pixel(0x00);
+}
+
+void escribir_texto(unsigned char pg, unsigned char col,
+                    const char *msg){
+    display_cursor(pg, col);
+    while(*msg)
+        escribir_char(*msg++);
+}
+
+/*=========================================================
+ * UTILIDADES - Conversion de numeros a texto
+ * La OLED solo dibuja caracteres, no numeros directamente
+ *=========================================================*/
+
+/* Escribe un numero entero sin signo en la OLED.
+ * digitos: cuantos digitos mostrar (rellena con ceros)
+ * Ejemplo: num=235, digitos=3 -> "235"
+ *          num=7,   digitos=3 -> "007"               */
+static void escribir_numero(unsigned char pg, unsigned char col,
+                             unsigned int num, unsigned char digitos){
+    char buf[6];
+    signed char i;
+
+    for(i = digitos - 1; i >= 0; i--){
+        buf[i] = '0' + (num % 10);
+        num   /= 10;
+    }
+    buf[digitos] = '\0';
+    escribir_texto(pg, col, buf);
+}
+
+/*=========================================================
+ * PROGRAMA PRINCIPAL
+ *=========================================================*/
+void main(void){
+    signed long  temperatura;   /* En centesimas de grado C  */
+    unsigned int humedad;       /* En decimas de %RH         */
+    unsigned int temp_ent, temp_dec;  /* Parte entera y decimal */
+    unsigned int hum_ent,  hum_dec;
+
+    OSCCON = 0x72;          /* Oscilador interno 8MHz         */
+    ADCON1 = 0x0F;          /* Puerto B completamente digital */
+
+    bus_init();             /* Iniciar modulo I2C             */
+    display_init();         /* Iniciar OLED                   */
+    bme_init();             /* Iniciar BME280                 */
+
+    /* --- Encabezado fijo en pantalla --- */
+    escribir_texto(0, 0, "BME280 - I2C");
+    escribir_texto(1, 0, "UNICAUCA");
+    escribir_texto(3, 0, "TEMP");
+    escribir_texto(3, 70, "C");
+    escribir_texto(5, 0, "HUM");
+    escribir_texto(5, 70, "PCT");
+
+    for(;;){
+        bme_leer(&temperatura, &humedad);
+
+        /* Descompongo temperatura: ej 2315 -> 23 grados, 15 centesimas */
+        temp_ent = (unsigned int)( temperatura / 100);
+        temp_dec = (unsigned int)( temperatura % 100);
+
+        /* Descompongo humedad: ej 502 -> 50 enteros, 2 decimas */
+        hum_ent  = humedad / 10;
+        hum_dec  = humedad % 10;
+
+        /* Fila temperatura: "XX.XX" */
+        escribir_numero(4, 0,  temp_ent, 2);
+        escribir_texto (4, 14, ".");
+        escribir_numero(4, 20, temp_dec, 2);
+
+        /* Fila humedad: "XX.X" */
+        escribir_numero(6, 0,  hum_ent, 2);
+        escribir_texto (6, 14, ".");
+        escribir_numero(6, 20, hum_dec, 1);
+
+        __delay_ms(1000);   /* Actualizo cada segundo         */
+    }
+}
