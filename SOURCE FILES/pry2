@@ -2,7 +2,8 @@
  * File:   pry2.c
  * Author: MARIA DE LOS ANGELES
  *
- * Created on 18 de abril de 2026, 22:47
+ * PIC18F4550 + SSD1306 I2C + LM35 en AN0 + LDR en AN1
+ * Oscilador interno obligatorio a 8 MHz
  */
 
 #include <xc.h>
@@ -11,15 +12,21 @@
 #include "adc.h"
 #include "i2c.h"
 #include "ssd1306_oled.h"
+#include "sensores.h"
+#include "bme280_lib.h"
 
 char txt_temp[20];
+char txt_luz[20];
+char txt_hum[20];
+
 float temp;
+float humedad;
+
 unsigned int temp_x10;
 unsigned int entero;
 unsigned char decimal;
-
 unsigned int luz_pct;
-char txt_luz[20];
+unsigned char bme_ok;
 
 void main(void)
 {
@@ -27,43 +34,103 @@ void main(void)
 
     TRISAbits.TRISA0 = 1;
     TRISAbits.TRISA1 = 1;
+    // Salida para el rele
+    RELE_TRIS = 0;          // RB3 como salida
+    RELE_PIN  = OFF;        // Apagado al iniciar
+
     ADC_Init(AN0_AN1_ANALOG);
 
     I2C_Init_Master(I2C_100KHZ);
     OLED_Init();
 
+    bme_ok = BME280_Init();
+
     while(1)
     {
         temp = LM35_ObtenerTemp();
 
-        if(temp < 0.0f)
-        {
+        if(temp < 0.0f) {
+
             temp = 0.0f;
         }
 
         temp_x10 = (unsigned int)(temp * 10.0f + 0.5f);
         entero = temp_x10 / 10;
         decimal = (unsigned char)(temp_x10 % 10);
+
+        // --- Control del rele con histeresis ---
+        if(temp < TEMP_LOW) {
+
+            RELE_PIN = ON;     // Temperatura baja: enciende calentador
+        }
+        else if(temp > TEMP_HIGH) {
+
+            RELE_PIN = OFF;    // Temperatura alta: apaga calentador
+        }
         
         luz_pct = LDR_ObtenerPorcentaje();
+
+        if(bme_ok) {
+
+            humedad = leer_humedad();
+        }
+        else{
+
+            humedad = -1.0f;
+        }
+        
+        // --- Control del ventilador
+        if(humedad < 0.0f || humedad < HUM_BAJA)        // sensor error O humedad baja
+        {
+            PWM_SetDuty(0);
+        }
+        else if(humedad < HUM_MEDIA)
+        {
+            PWM_SetDuty(50);
+        }
+        else
+        {
+            PWM_SetDuty(100);
+        }
 
         OLED_ClearDisplay();
 
         OLED_SetFont(FONT_1);
         OLED_Write_Text(0, 0, "LM35");
-        OLED_Write_Text(70, 0, "LDR");
+        OLED_Write_Text(48, 0, "LDR");
+        OLED_Write_Text(92, 0, "MQ135");
         OLED_Write_Text(0, 10, "Temp:");
-        OLED_Write_Text(70, 10, "Luz:");
+        OLED_Write_Text(48, 10, "Luz:");
+        OLED_Write_Text(92, 10, "Gas:");
+        
 
-        OLED_SetFont(FONT_2);
+        OLED_SetFont(FONT_1);
         sprintf(txt_temp, "%u.%u C", entero, decimal);
         OLED_Write_Text(0, 24, txt_temp);
 
         sprintf(txt_luz, "%u%%", luz_pct);
-        OLED_Write_Text(70, 24, txt_luz);
+        OLED_Write_Text(48, 24, txt_luz);
+        
+        if(MQ135_GasDetectado()){
 
+            OLED_Write_Text(92, 24, "ALTO");
+        }
+        else{
+
+            OLED_Write_Text(92, 24, "OK");
+        }
+
+        if(humedad < 0.0f){
+
+            OLED_Write_Text(32, 42, "ERR");
+        }
+        else{
+            
+            sprintf(txt_hum, "%.1f%%", humedad);
+            OLED_Write_Text(32, 42, txt_hum);
+        }
 
         OLED_Update();
-        __delay_ms(300);
+        __delay_ms(200);
     }
 }
