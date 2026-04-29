@@ -1,0 +1,358 @@
+/*=========================================================
+ * PIC18F4550 - Sensor LM35 + Display OLED SSD1306
+ * Proyecto:    Lectura de temperatura con LM35
+ * Sensor:      LM35 (salida analogica en AN1)
+ * Display:     OLED 128x64 via I2C (0x78)
+ *
+ * Funcionamiento del LM35:
+ *   Salida lineal de 10mV por cada grado Celsius
+ *   0°C  ->  0.00V
+ *   25°C ->  0.25V
+ *   100°C -> 1.00V
+ *
+ *   Formula de conversion:
+ *   Temp(°C) = (ADC * Vref) / (1023 * 0.01)
+ *   Con Vref = 5V:
+ *   Temp(°C) = (ADC * 500) / 1023
+ *   Resultado en decimas de grado: 253 = 25.3°C
+ *
+ * Circuito:
+ *   VCC (5V) -> pin VS  del LM35
+ *   GND      -> pin GND del LM35
+ *   AN1(RA1) -> pin VOUT del LM35
+ *
+ * Conexiones:
+ *   RA1      -> VOUT LM35
+ *   RB0 SDA  -> SDA OLED
+ *   RB1 SCL  -> SCL OLED
+ *   Pull-ups 4.7k en SDA y SCL
+ *
+ * NOTA: Se usa AN1 (RA1) para no interferir con AN0
+ *       que se uso para el LDR en el proyecto anterior.
+ *       Asi ambos sensores pueden coexistir si se desea.
+ *
+ * Entorno: MPLAB X + XC8 | Oscilador interno 8MHz
+ *=========================================================*/
+
+#pragma config FOSC   = INTOSC_EC
+#pragma config WDT    = OFF
+#pragma config LVP    = OFF
+#pragma config PBADEN = OFF
+#pragma config MCLRE  = OFF
+#pragma config XINST  = OFF
+#pragma config PWRT   = ON
+#pragma config DEBUG  = OFF
+
+#include <xc.h>
+#define _XTAL_FREQ 8000000
+
+/*--- Display OLED SSD1306 ---*/
+#define DISPLAY_ADDR    0x78
+#define CTRL_CMD        0x00
+#define CTRL_DATA       0x40
+
+/*--- ADC LM35 ---
+ * Vref = 5V, ADC 10 bits
+ * Factor = (5000mV * 10) / 1023 = ~48.87
+ * Usamos enteros: Temp_decimas = (ADC * 500) / 1023  */
+#define LM35_FACTOR_NUM  500UL
+#define LM35_FACTOR_DEN  1023UL
+
+/*--- Velocidad I2C ---*/
+#define BRG_VAL         19
+
+/*=========================================================
+ * CAPA I2C
+ *=========================================================*/
+
+static void bus_esperar(void){
+    while(SSPSTATbits.BF || (SSPCON2 & 0x1F));
+    __delay_us(5);
+}
+
+static void bus_inicio(unsigned char direccion){
+    bus_esperar();
+    SSPCON2bits.SEN = 1;
+    while(SSPCON2bits.SEN);
+    SSPBUF = direccion;
+    while(!PIR1bits.SSPIF);
+    PIR1bits.SSPIF = 0;
+}
+
+static void bus_enviar(unsigned char byte){
+    bus_esperar();
+    SSPBUF = byte;
+    while(!PIR1bits.SSPIF);
+    PIR1bits.SSPIF = 0;
+}
+
+static void bus_fin(void){
+    bus_esperar();
+    SSPCON2bits.PEN = 1;
+    while(SSPCON2bits.PEN);
+    PIR1bits.SSPIF = 0;
+}
+
+void bus_init(void){
+    TRISBbits.TRISB0 = 1;
+    TRISBbits.TRISB1 = 1;
+    SSPSTAT  = 0x80;
+    SSPCON1  = 0x28;
+    SSPCON2  = 0x00;
+    SSPADD   = BRG_VAL;
+    PIR1bits.SSPIF = 0;
+}
+
+/*=========================================================
+ * CAPA ADC
+ * LM35 conectado a RA1 = canal AN1
+ *=========================================================*/
+
+void adc_init(void){
+    TRISA  = 0xFF;          /* Puerto A como entrada            */
+    ADCON1 = 0x0D;          /* AN0 y AN1 analogicos             */
+
+    /* Canal AN1, ADC encendido */
+    ADCON0 = 0x05;          /* CHS=0001 (AN1), ADON=1           */
+    ADCON2 = 0xAA;          /* Fosc/32, 12TAD, just. derecha    */
+    __delay_ms(1);
+}
+
+unsigned int adc_leer(void){
+    ADCON0bits.GO = 1;
+    while(ADCON0bits.GO);
+    return ((unsigned int)(ADRESH << 8) | ADRESL);
+}
+
+/* Convierte lectura ADC a temperatura en decimas de grado
+ * Ejemplo: retorna 253 -> 25.3 C                             */
+unsigned int adc_a_temperatura(unsigned int adc){
+    return (unsigned int)((( unsigned long)adc * LM35_FACTOR_NUM)
+                           / LM35_FACTOR_DEN);
+}
+
+/*=========================================================
+ * CAPA OLED
+ *=========================================================*/
+
+static void display_cmd(unsigned char c){
+    bus_inicio(DISPLAY_ADDR);
+    bus_enviar(CTRL_CMD);
+    bus_enviar(c);
+    bus_fin();
+}
+
+static void display_pixel(unsigned char d){
+    bus_inicio(DISPLAY_ADDR);
+    bus_enviar(CTRL_DATA);
+    bus_enviar(d);
+    bus_fin();
+}
+
+void display_borrar(void){
+    unsigned char pg, col;
+    for(pg = 0; pg < 8; pg++){
+        display_cmd(0xB0 | pg);
+        display_cmd(0x00);
+        display_cmd(0x10);
+        for(col = 0; col < 128; col++)
+            display_pixel(0x00);
+    }
+}
+
+void display_cursor(unsigned char pg, unsigned char col){
+    display_cmd(0xB0 | pg);
+    display_cmd(col & 0x0F);
+    display_cmd(0x10 | ((col >> 4) & 0x0F));
+}
+
+void display_init(void){
+    __delay_ms(100);
+    display_cmd(0xAE);
+    display_cmd(0xD5); display_cmd(0x80);
+    display_cmd(0xA8); display_cmd(0x3F);
+    display_cmd(0xD3); display_cmd(0x00);
+    display_cmd(0x40);
+    display_cmd(0x8D); display_cmd(0x14);
+    display_cmd(0x20); display_cmd(0x00);
+    display_cmd(0xA1);
+    display_cmd(0xC8);
+    display_cmd(0xDA); display_cmd(0x12);
+    display_cmd(0x81); display_cmd(0xCF);
+    display_cmd(0xD9); display_cmd(0xF1);
+    display_cmd(0xDB); display_cmd(0x40);
+    display_cmd(0xA4);
+    display_cmd(0xA6);
+    display_cmd(0xAF);
+    __delay_ms(10);
+    display_borrar();
+}
+
+static const unsigned char FUENTE[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, /* SP */
+    {0x00,0x00,0x5F,0x00,0x00}, /* !  */
+    {0x00,0x07,0x00,0x07,0x00}, /* "  */
+    {0x14,0x7F,0x14,0x7F,0x14}, /* #  */
+    {0x24,0x2A,0x7F,0x2A,0x12}, /* $  */
+    {0x23,0x13,0x08,0x64,0x62}, /* %  */
+    {0x36,0x49,0x55,0x22,0x50}, /* &  */
+    {0x00,0x05,0x03,0x00,0x00}, /* '  */
+    {0x00,0x1C,0x22,0x41,0x00}, /* (  */
+    {0x00,0x41,0x22,0x1C,0x00}, /* )  */
+    {0x08,0x2A,0x1C,0x2A,0x08}, /* *  */
+    {0x08,0x08,0x3E,0x08,0x08}, /* +  */
+    {0x00,0x50,0x30,0x00,0x00}, /* ,  */
+    {0x08,0x08,0x08,0x08,0x08}, /* -  */
+    {0x00,0x60,0x60,0x00,0x00}, /* .  */
+    {0x20,0x10,0x08,0x04,0x02}, /* /  */
+    {0x3E,0x51,0x49,0x45,0x3E}, /* 0  */
+    {0x00,0x42,0x7F,0x40,0x00}, /* 1  */
+    {0x42,0x61,0x51,0x49,0x46}, /* 2  */
+    {0x21,0x41,0x45,0x4B,0x31}, /* 3  */
+    {0x18,0x14,0x12,0x7F,0x10}, /* 4  */
+    {0x27,0x45,0x45,0x45,0x39}, /* 5  */
+    {0x3C,0x4A,0x49,0x49,0x30}, /* 6  */
+    {0x01,0x71,0x09,0x05,0x03}, /* 7  */
+    {0x36,0x49,0x49,0x49,0x36}, /* 8  */
+    {0x06,0x49,0x49,0x29,0x1E}, /* 9  */
+    {0x00,0x36,0x36,0x00,0x00}, /* :  */
+    {0x00,0x56,0x36,0x00,0x00}, /* ;  */
+    {0x00,0x08,0x14,0x22,0x41}, /* <  */
+    {0x14,0x14,0x14,0x14,0x14}, /* =  */
+    {0x41,0x22,0x14,0x08,0x00}, /* >  */
+    {0x02,0x01,0x51,0x09,0x06}, /* ?  */
+    {0x32,0x49,0x79,0x41,0x3E}, /* @  */
+    {0x7E,0x11,0x11,0x11,0x7E}, /* A  */
+    {0x7F,0x49,0x49,0x49,0x36}, /* B  */
+    {0x3E,0x41,0x41,0x41,0x22}, /* C  */
+    {0x7F,0x41,0x41,0x22,0x1C}, /* D  */
+    {0x7F,0x49,0x49,0x49,0x41}, /* E  */
+    {0x7F,0x09,0x09,0x09,0x01}, /* F  */
+    {0x3E,0x41,0x49,0x49,0x7A}, /* G  */
+    {0x7F,0x08,0x08,0x08,0x7F}, /* H  */
+    {0x00,0x41,0x7F,0x41,0x00}, /* I  */
+    {0x20,0x40,0x41,0x3F,0x01}, /* J  */
+    {0x7F,0x08,0x14,0x22,0x41}, /* K  */
+    {0x7F,0x40,0x40,0x40,0x40}, /* L  */
+    {0x7F,0x02,0x04,0x02,0x7F}, /* M  */
+    {0x7F,0x04,0x08,0x10,0x7F}, /* N  */
+    {0x3E,0x41,0x41,0x41,0x3E}, /* O  */
+    {0x7F,0x09,0x09,0x09,0x06}, /* P  */
+    {0x3E,0x41,0x51,0x21,0x5E}, /* Q  */
+    {0x7F,0x09,0x19,0x29,0x46}, /* R  */
+    {0x46,0x49,0x49,0x49,0x31}, /* S  */
+    {0x01,0x01,0x7F,0x01,0x01}, /* T  */
+    {0x3F,0x40,0x40,0x40,0x3F}, /* U  */
+    {0x1F,0x20,0x40,0x20,0x1F}, /* V  */
+    {0x3F,0x40,0x38,0x40,0x3F}, /* W  */
+    {0x63,0x14,0x08,0x14,0x63}, /* X  */
+    {0x07,0x08,0x70,0x08,0x07}, /* Y  */
+    {0x61,0x51,0x49,0x45,0x43}, /* Z  */
+};
+
+static void escribir_char(unsigned char c){
+    unsigned char k;
+    if(c < 32 || c > 90) c = 32;
+    for(k = 0; k < 5; k++)
+        display_pixel(FUENTE[c - 32][k]);
+    display_pixel(0x00);
+}
+
+void escribir_texto(unsigned char pg, unsigned char col,
+                    const char *msg){
+    display_cursor(pg, col);
+    while(*msg)
+        escribir_char(*msg++);
+}
+
+static void escribir_numero(unsigned char pg, unsigned char col,
+                             unsigned int num, unsigned char digitos){
+    char buf[6];
+    signed char i;
+    for(i = digitos - 1; i >= 0; i--){
+        buf[i] = '0' + (num % 10);
+        num   /= 10;
+    }
+    buf[digitos] = '\0';
+    escribir_texto(pg, col, buf);
+}
+
+/*=========================================================
+ * BARRA DE TEMPERATURA
+ * Rango visual: 0 a 50 C (rango util del LM35)
+ * Ancho maximo: 120 pixeles = 50 C
+ * 1 pixel = 0.416 C
+ *=========================================================*/
+void dibujar_barra_temp(unsigned char pg, unsigned int temp_dec){
+    unsigned char ancho, col;
+    unsigned int  temp_ent;
+
+    temp_ent = temp_dec / 10;               /* Solo parte entera */
+    if(temp_ent > 50) temp_ent = 50;        /* Limito a 50 C     */
+
+    ancho = (unsigned char)((temp_ent * 120U) / 50U);
+
+    display_cursor(pg, 4);
+    for(col = 0; col < 120; col++){
+        if(col < ancho)
+            display_pixel(0x3C);            /* Barra llena       */
+        else
+            display_pixel(0x00);            /* Barra vacia       */
+    }
+}
+
+/*=========================================================
+ * PROGRAMA PRINCIPAL
+ *=========================================================*/
+void main(void){
+    unsigned int lectura_adc;       /* Valor crudo 0-1023        */
+    unsigned int temperatura;       /* En decimas de C           */
+    unsigned int temp_ent;          /* Parte entera              */
+    unsigned int temp_dec;          /* Parte decimal             */
+
+    OSCCON = 0x72;          /* Oscilador interno 8MHz            */
+
+    bus_init();             /* Iniciar modulo I2C                */
+    adc_init();             /* Iniciar ADC en AN1                */
+    display_init();         /* Iniciar OLED                      */
+
+    /* --- Encabezado fijo --- */
+    escribir_texto(0, 0, "LM35 - TEMP");
+    escribir_texto(1, 0, "UNICAUCA");
+    escribir_texto(3, 0, "TEMP");
+    escribir_texto(3, 56, "C");
+    escribir_texto(5, 0, "ESTADO");
+    escribir_texto(7, 0, "ADC");
+
+    for(;;){
+        lectura_adc  = adc_leer();
+        temperatura  = adc_a_temperatura(lectura_adc);
+
+        /* Separo parte entera y decimal
+         * temperatura en decimas: 253 -> 25 entero, 3 decimal  */
+        temp_ent = temperatura / 10;
+        temp_dec = temperatura % 10;
+
+        /* Temperatura: "XX.X" */
+        escribir_numero(4, 0,  temp_ent, 2);
+        escribir_texto (4, 14, ".");
+        escribir_numero(4, 20, temp_dec, 1);
+
+        /* Barra grafica 0-50 C */
+        dibujar_barra_temp(6, temperatura);
+
+        /* Estado cualitativo */
+        if(temp_ent >= 35){
+            escribir_texto(5, 42, "CALIENTE");
+        } else if(temp_ent >= 20){
+            escribir_texto(5, 42, "NORMAL  ");
+        } else {
+            escribir_texto(5, 42, "FRIO    ");
+        }
+
+        /* Valor ADC crudo */
+        escribir_numero(7, 30, lectura_adc, 4);
+
+        __delay_ms(500);    /* Actualizo cada 500ms              */
+    }
+}
