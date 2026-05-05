@@ -1,0 +1,422 @@
+/*=========================================================
+ * PIC18F4550 - Sensor MQ-135 + Display OLED SSD1306
+ * Proyecto:    Detector de gas con ventilador y alarma
+ * Sensor:      MQ-135 salida digital (DOUT)
+ * Display:     OLED 128x64 via I2C (0x78)
+ *
+ * Logica de funcionamiento:
+ *   1. MQ-135 detecta gas -> DOUT = 0 (activo bajo)
+ *   2. Al detectar gas:
+ *      - Se muestra "GAS DETECTADO" en OLED
+ *      - Se enciende el ventilador (RC2)
+ *      - Se inicia contador de persistencia
+ *   3. Si el gas persiste mas de TIEMPO_ALARMA segundos:
+ *      - Se activa el buzzer (RB4)
+ *      - Se muestra "ALARMA" en OLED
+ *   4. Al desaparecer el gas:
+ *      - Se apagan ventilador y buzzer
+ *      - Se resetea el contador
+ *      - Se muestra "NORMAL" en OLED
+ *
+ * Pines:
+ *   RB0 (SDA)  -> SDA OLED
+ *   RB1 (SCL)  -> SCL OLED
+ *   RB2        -> DOUT MQ-135 (entrada, activo bajo)
+ *   RB4        -> Buzzer      (salida, activo alto)
+ *   RC2        -> Ventilador  (salida, activo alto)
+ *
+ * NOTA MQ-135 salida digital:
+ *   DOUT = 0 -> gas detectado (supera umbral del potenciometro)
+ *   DOUT = 1 -> nivel normal
+ *   El umbral se ajusta fisicamente con el potenciometro
+ *   del modulo hasta que el LED indicador se encienda
+ *   en el nivel de gas que se quiere detectar.
+ *
+ * Entorno: MPLAB X + XC8 | Oscilador interno 8MHz
+ *=========================================================*/
+
+#pragma config FOSC   = INTOSC_EC
+#pragma config WDT    = OFF
+#pragma config LVP    = OFF
+#pragma config PBADEN = OFF
+#pragma config MCLRE  = OFF
+#pragma config XINST  = OFF
+#pragma config PWRT   = ON
+#pragma config DEBUG  = OFF
+
+#include <xc.h>
+#define _XTAL_FREQ 8000000
+
+/*--- Display OLED ---*/
+#define DISPLAY_ADDR    0x78
+#define CTRL_CMD        0x00
+#define CTRL_DATA       0x40
+
+/*--- Pines MQ-135, ventilador y buzzer ---*/
+#define PIN_GAS         PORTBbits.RB2   /* Entrada DOUT MQ-135  */
+#define PIN_VENTILADOR  LATCbits.LATC2  /* Salida ventilador    */
+#define PIN_BUZZER      LATBbits.LATB4  /* Salida buzzer        */
+
+/*--- Tiempo de persistencia para activar alarma ---
+ * Cada ciclo del loop tarda ~500ms (delay + ejecucion)
+ * TIEMPO_ALARMA = cantidad de ciclos antes de buzzer
+ * 20 ciclos x 500ms = ~10 segundos                            */
+#define TIEMPO_ALARMA   20
+
+/*--- Velocidad I2C ---*/
+#define BRG_VAL         19
+
+/*=========================================================
+ * CAPA I2C
+ *=========================================================*/
+
+static void bus_esperar(void){
+    while(SSPSTATbits.BF || (SSPCON2 & 0x1F));
+    __delay_us(5);
+}
+
+static void bus_inicio(unsigned char direccion){
+    bus_esperar();
+    SSPCON2bits.SEN = 1;
+    while(SSPCON2bits.SEN);
+    SSPBUF = direccion;
+    while(!PIR1bits.SSPIF);
+    PIR1bits.SSPIF = 0;
+}
+
+static void bus_enviar(unsigned char byte){
+    bus_esperar();
+    SSPBUF = byte;
+    while(!PIR1bits.SSPIF);
+    PIR1bits.SSPIF = 0;
+}
+
+static void bus_fin(void){
+    bus_esperar();
+    SSPCON2bits.PEN = 1;
+    while(SSPCON2bits.PEN);
+    PIR1bits.SSPIF = 0;
+}
+
+void bus_init(void){
+    TRISBbits.TRISB0 = 1;      /* SDA entrada              */
+    TRISBbits.TRISB1 = 1;      /* SCL entrada              */
+    SSPSTAT  = 0x80;
+    SSPCON1  = 0x28;
+    SSPCON2  = 0x00;
+    SSPADD   = BRG_VAL;
+    PIR1bits.SSPIF = 0;
+}
+
+/*=========================================================
+ * CAPA OLED
+ *=========================================================*/
+
+static void display_cmd(unsigned char c){
+    bus_inicio(DISPLAY_ADDR);
+    bus_enviar(CTRL_CMD);
+    bus_enviar(c);
+    bus_fin();
+}
+
+static void display_pixel(unsigned char d){
+    bus_inicio(DISPLAY_ADDR);
+    bus_enviar(CTRL_DATA);
+    bus_enviar(d);
+    bus_fin();
+}
+
+void display_borrar(void){
+    unsigned char pg, col;
+    for(pg = 0; pg < 8; pg++){
+        display_cmd(0xB0 | pg);
+        display_cmd(0x00);
+        display_cmd(0x10);
+        for(col = 0; col < 128; col++)
+            display_pixel(0x00);
+    }
+}
+
+/* Borra solo una pagina especifica (mas rapido que borrar todo) */
+void display_borrar_pagina(unsigned char pg){
+    unsigned char col;
+    display_cmd(0xB0 | pg);
+    display_cmd(0x00);
+    display_cmd(0x10);
+    for(col = 0; col < 128; col++)
+        display_pixel(0x00);
+}
+
+void display_cursor(unsigned char pg, unsigned char col){
+    display_cmd(0xB0 | pg);
+    display_cmd(col & 0x0F);
+    display_cmd(0x10 | ((col >> 4) & 0x0F));
+}
+
+void display_init(void){
+    __delay_ms(100);
+    display_cmd(0xAE);
+    display_cmd(0xD5); display_cmd(0x80);
+    display_cmd(0xA8); display_cmd(0x3F);
+    display_cmd(0xD3); display_cmd(0x00);
+    display_cmd(0x40);
+    display_cmd(0x8D); display_cmd(0x14);
+    display_cmd(0x20); display_cmd(0x00);
+    display_cmd(0xA1);
+    display_cmd(0xC8);
+    display_cmd(0xDA); display_cmd(0x12);
+    display_cmd(0x81); display_cmd(0xCF);
+    display_cmd(0xD9); display_cmd(0xF1);
+    display_cmd(0xDB); display_cmd(0x40);
+    display_cmd(0xA4);
+    display_cmd(0xA6);
+    display_cmd(0xAF);
+    __delay_ms(10);
+    display_borrar();
+}
+
+static const unsigned char FUENTE[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, /* SP */
+    {0x00,0x00,0x5F,0x00,0x00}, /* !  */
+    {0x00,0x07,0x00,0x07,0x00}, /* "  */
+    {0x14,0x7F,0x14,0x7F,0x14}, /* #  */
+    {0x24,0x2A,0x7F,0x2A,0x12}, /* $  */
+    {0x23,0x13,0x08,0x64,0x62}, /* %  */
+    {0x36,0x49,0x55,0x22,0x50}, /* &  */
+    {0x00,0x05,0x03,0x00,0x00}, /* '  */
+    {0x00,0x1C,0x22,0x41,0x00}, /* (  */
+    {0x00,0x41,0x22,0x1C,0x00}, /* )  */
+    {0x08,0x2A,0x1C,0x2A,0x08}, /* *  */
+    {0x08,0x08,0x3E,0x08,0x08}, /* +  */
+    {0x00,0x50,0x30,0x00,0x00}, /* ,  */
+    {0x08,0x08,0x08,0x08,0x08}, /* -  */
+    {0x00,0x60,0x60,0x00,0x00}, /* .  */
+    {0x20,0x10,0x08,0x04,0x02}, /* /  */
+    {0x3E,0x51,0x49,0x45,0x3E}, /* 0  */
+    {0x00,0x42,0x7F,0x40,0x00}, /* 1  */
+    {0x42,0x61,0x51,0x49,0x46}, /* 2  */
+    {0x21,0x41,0x45,0x4B,0x31}, /* 3  */
+    {0x18,0x14,0x12,0x7F,0x10}, /* 4  */
+    {0x27,0x45,0x45,0x45,0x39}, /* 5  */
+    {0x3C,0x4A,0x49,0x49,0x30}, /* 6  */
+    {0x01,0x71,0x09,0x05,0x03}, /* 7  */
+    {0x36,0x49,0x49,0x49,0x36}, /* 8  */
+    {0x06,0x49,0x49,0x29,0x1E}, /* 9  */
+    {0x00,0x36,0x36,0x00,0x00}, /* :  */
+    {0x00,0x56,0x36,0x00,0x00}, /* ;  */
+    {0x00,0x08,0x14,0x22,0x41}, /* <  */
+    {0x14,0x14,0x14,0x14,0x14}, /* =  */
+    {0x41,0x22,0x14,0x08,0x00}, /* >  */
+    {0x02,0x01,0x51,0x09,0x06}, /* ?  */
+    {0x32,0x49,0x79,0x41,0x3E}, /* @  */
+    {0x7E,0x11,0x11,0x11,0x7E}, /* A  */
+    {0x7F,0x49,0x49,0x49,0x36}, /* B  */
+    {0x3E,0x41,0x41,0x41,0x22}, /* C  */
+    {0x7F,0x41,0x41,0x22,0x1C}, /* D  */
+    {0x7F,0x49,0x49,0x49,0x41}, /* E  */
+    {0x7F,0x09,0x09,0x09,0x01}, /* F  */
+    {0x3E,0x41,0x49,0x49,0x7A}, /* G  */
+    {0x7F,0x08,0x08,0x08,0x7F}, /* H  */
+    {0x00,0x41,0x7F,0x41,0x00}, /* I  */
+    {0x20,0x40,0x41,0x3F,0x01}, /* J  */
+    {0x7F,0x08,0x14,0x22,0x41}, /* K  */
+    {0x7F,0x40,0x40,0x40,0x40}, /* L  */
+    {0x7F,0x02,0x04,0x02,0x7F}, /* M  */
+    {0x7F,0x04,0x08,0x10,0x7F}, /* N  */
+    {0x3E,0x41,0x41,0x41,0x3E}, /* O  */
+    {0x7F,0x09,0x09,0x09,0x06}, /* P  */
+    {0x3E,0x41,0x51,0x21,0x5E}, /* Q  */
+    {0x7F,0x09,0x19,0x29,0x46}, /* R  */
+    {0x46,0x49,0x49,0x49,0x31}, /* S  */
+    {0x01,0x01,0x7F,0x01,0x01}, /* T  */
+    {0x3F,0x40,0x40,0x40,0x3F}, /* U  */
+    {0x1F,0x20,0x40,0x20,0x1F}, /* V  */
+    {0x3F,0x40,0x38,0x40,0x3F}, /* W  */
+    {0x63,0x14,0x08,0x14,0x63}, /* X  */
+    {0x07,0x08,0x70,0x08,0x07}, /* Y  */
+    {0x61,0x51,0x49,0x45,0x43}, /* Z  */
+};
+
+static void escribir_char(unsigned char c){
+    unsigned char k;
+    if(c < 32 || c > 90) c = 32;
+    for(k = 0; k < 5; k++)
+        display_pixel(FUENTE[c - 32][k]);
+    display_pixel(0x00);
+}
+
+void escribir_texto(unsigned char pg, unsigned char col,
+                    const char *msg){
+    display_cursor(pg, col);
+    while(*msg)
+        escribir_char(*msg++);
+}
+
+static void escribir_numero(unsigned char pg, unsigned char col,
+                             unsigned int num, unsigned char digitos){
+    char buf[6];
+    signed char i;
+    for(i = digitos - 1; i >= 0; i--){
+        buf[i] = '0' + (num % 10);
+        num   /= 10;
+    }
+    buf[digitos] = '\0';
+    escribir_texto(pg, col, buf);
+}
+
+/*=========================================================
+ * ESTADOS DEL SISTEMA
+ * Maquina de estados para manejar la logica de deteccion,
+ * ventilador y alarma de forma ordenada y sin bloqueos
+ *=========================================================*/
+typedef enum {
+    ESTADO_NORMAL = 0,      /* Sin gas, todo apagado        */
+    ESTADO_GAS_DETECTADO,   /* Gas presente, ventilador ON  */
+    ESTADO_ALARMA           /* Gas persistente, buzzer ON   */
+} EstadoSistema;
+
+/*=========================================================
+ * CAPA MQ-135
+ * Maneja la lectura del pin digital y el control
+ * del ventilador, buzzer y pantalla segun el estado
+ *=========================================================*/
+
+void mq135_init(void){
+    TRISBbits.TRISB2 = 1;  /* RB2 como entrada (DOUT MQ135)*/
+    TRISBbits.TRISB4 = 0;  /* RB4 como salida  (buzzer)    */
+    TRISCbits.TRISC2 = 0;  /* RC2 como salida  (ventilador)*/
+
+    PIN_VENTILADOR = 0;     /* Ventilador apagado           */
+    PIN_BUZZER     = 0;     /* Buzzer apagado               */
+}
+
+/* Retorna 1 si hay gas detectado, 0 si esta normal
+ * DOUT del MQ-135 es ACTIVO BAJO:
+ *   0 = gas detectado
+ *   1 = normal                                             */
+unsigned char mq135_gas_presente(void){
+    return (PIN_GAS == 0) ? 1 : 0;
+}
+
+/*=========================================================
+ * PANTALLA - Funciones de estado
+ * Cada funcion dibuja el estado completo en la OLED
+ * Borran solo las paginas que cambian para evitar
+ * parpadeo innecesario
+ *=========================================================*/
+
+void pantalla_normal(void){
+    display_borrar_pagina(3);
+    display_borrar_pagina(4);
+    display_borrar_pagina(5);
+    display_borrar_pagina(6);
+    escribir_texto(3, 10, "ESTADO");
+    escribir_texto(4, 10, "NORMAL");
+    escribir_texto(5, 10, "VENTILADOR OFF");
+    escribir_texto(6, 10, "BUZZER OFF");
+}
+
+void pantalla_gas_detectado(unsigned int contador){
+    display_borrar_pagina(3);
+    display_borrar_pagina(4);
+    display_borrar_pagina(5);
+    display_borrar_pagina(6);
+    escribir_texto  (3, 10, "GAS DETECTADO");
+    escribir_texto  (4, 10, "VENTILADOR ON");
+    escribir_texto  (5, 10, "TIEMPO");
+    escribir_numero (5, 52, contador, 3);
+    escribir_texto  (6, 10, "BUZZER OFF");
+}
+
+void pantalla_alarma(unsigned int contador){
+    display_borrar_pagina(3);
+    display_borrar_pagina(4);
+    display_borrar_pagina(5);
+    display_borrar_pagina(6);
+    escribir_texto  (3, 10, "GAS DETECTADO");
+    escribir_texto  (4, 10, "VENTILADOR ON");
+    escribir_texto  (5, 10, "TIEMPO");
+    escribir_numero (5, 52, contador, 3);
+    escribir_texto  (6, 10, "ALARMA ACTIVA");
+}
+
+/*=========================================================
+ * PROGRAMA PRINCIPAL
+ *=========================================================*/
+void main(void){
+    EstadoSistema estado    = ESTADO_NORMAL;
+    EstadoSistema estado_ant= ESTADO_NORMAL; /* Para detectar cambios */
+    unsigned int  contador  = 0;  /* Ciclos con gas presente   */
+
+    OSCCON = 0x72;          /* Oscilador interno 8MHz            */
+    ADCON1 = 0x0F;          /* Todo el puerto B digital          */
+
+    bus_init();             /* Iniciar I2C                       */
+    display_init();         /* Iniciar OLED                      */
+    mq135_init();           /* Iniciar pines MQ-135              */
+
+    /* --- Encabezado fijo (no se borra nunca) --- */
+    escribir_texto(0, 0, "MQ-135 GAS");
+    escribir_texto(1, 0, "UNICAUCA");
+
+    /* Estado inicial en pantalla */
+    pantalla_normal();
+
+    for(;;){
+
+        /*--- Lectura del sensor ---*/
+        if(mq135_gas_presente()){
+            contador++;                     /* Acumulo tiempo con gas */
+
+            if(contador >= TIEMPO_ALARMA){
+                estado = ESTADO_ALARMA;     /* Gas persistente        */
+            } else {
+                estado = ESTADO_GAS_DETECTADO;
+            }
+        } else {
+            contador = 0;                   /* Reseteo al desaparecer */
+            estado   = ESTADO_NORMAL;
+        }
+
+        /*--- Control de actuadores segun estado ---*/
+        switch(estado){
+            case ESTADO_NORMAL:
+                PIN_VENTILADOR = 0;
+                PIN_BUZZER     = 0;
+                break;
+
+            case ESTADO_GAS_DETECTADO:
+                PIN_VENTILADOR = 1;
+                PIN_BUZZER     = 0;
+                break;
+
+            case ESTADO_ALARMA:
+                PIN_VENTILADOR = 1;
+                PIN_BUZZER     = 1;
+                break;
+        }
+
+        /*--- Actualizar pantalla solo si el estado cambio ---
+         * Evita redibujar constantemente y reduce parpadeo  */
+        if(estado != estado_ant){
+            switch(estado){
+                case ESTADO_NORMAL:
+                    pantalla_normal();
+                    break;
+                case ESTADO_GAS_DETECTADO:
+                    pantalla_gas_detectado(contador);
+                    break;
+                case ESTADO_ALARMA:
+                    pantalla_alarma(contador);
+                    break;
+            }
+            estado_ant = estado;
+        } else if(estado != ESTADO_NORMAL){
+            /* Si el estado no cambio pero hay gas,
+             * actualizo solo el contador en pantalla       */
+            escribir_numero(5, 52, contador, 3);
+        }
+
+        __delay_ms(500);    /* Ciclo cada 500ms = ~10s para alarma */
+    }
+}
