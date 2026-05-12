@@ -1,0 +1,275 @@
+#include <xc.h>
+#include <stdio.h>
+#include "config.h"
+#include "adc.h"
+#include "i2c.h"
+#include "ssd1306_oled.h"
+#include "sensores.h"
+#include "bme280_lib.h"
+
+/** @brief Buffer de texto para mostrar temperatura en la OLED. */
+char txt_temp[20];
+
+/** @brief Buffer de texto para mostrar nivel de gas en la OLED. */
+char txt_gas[20];
+
+/** @brief Buffer de texto para mostrar lectura de luz en la OLED. */
+char txt_luz[20];
+
+/** @brief Buffer de texto para mostrar humedad en la OLED. */
+char txt_hum[20];
+
+/** @brief Temperatura leida desde el sensor BME280, en grados Celsius. */
+float temp_bme;
+
+/** @brief Humedad relativa leida desde el sensor BME280, en porcentaje. */
+float humedad;
+
+/** @brief Temperatura leida desde el sensor DHT11, en grados Celsius. */
+float temp;
+
+/** @brief Humedad relativa leida desde el sensor DHT11, en porcentaje. */
+float hum_dht;
+
+/** @brief Estado de lectura del DHT11: 1 si la lectura es valida, 0 si falla. */
+short dht_ok;
+
+/** @brief Valor analogico digitalizado del sensor de gas MQ135. */
+unsigned int gas_val;
+
+/** @brief Valor analogico digitalizado del sensor de luz LDR. */
+unsigned int luz_ADC;
+
+/** @brief Estado de inicializacion del BME280: distinto de cero si fue exitoso. */
+unsigned char bme_ok;
+
+/**
+ * @brief Funcion principal del sistema de invernadero.
+ *
+ * @details
+ * Configura el oscilador, entradas analogicas, salidas digitales, ADC, I2C,
+ * pantalla OLED, PWM y sensor BME280. Luego ejecuta un ciclo infinito donde:
+ * - Lee el nivel de luz con la LDR y controla una barra de LEDs.
+ * - Lee temperatura y humedad del DHT11.
+ * - Controla un rele con histeresis segun temperatura.
+ * - Lee humedad y temperatura del BME280.
+ * - Lee calidad de aire con MQ135 y activa PWM/alarma segun umbrales.
+ * - Actualiza los valores en la pantalla OLED.
+ *
+ * @return Esta funcion no retorna porque contiene el ciclo principal infinito.
+ */
+void main(void)
+{
+    /** Configura el oscilador interno a 8 MHz. */
+    OSCCON = 0x72;
+
+    /** Configura AN0 y AN1 como entradas. */
+    TRISAbits.TRISA0 = 1;
+    TRISAbits.TRISA1 = 1;
+
+    /** Configura el rele como salida e inicia apagado. */
+    RELE_TRIS = 0;
+    RELE_PIN  = OFF;
+
+    /** Configura la alarma como salida e inicia apagado. */
+    ALARMA_TRIS = 0;
+    ALARMA_PIN  = OFF;
+
+    /** Configura los LEDs indicadores como salidas e inicia apagados. */
+    LED_TRIS = 0;
+    LED_PIN  = OFF;
+
+    LED2_TRIS = 0;
+    LED2_PIN  = OFF;
+
+    LED3_TRIS = 0;
+    LED3_PIN  = OFF;
+
+    LED4_TRIS = 0;
+    LED4_PIN  = OFF;
+
+    LED5_TRIS = 0;
+    LED5_PIN  = OFF;
+
+    /** Inicializa perifericos del sistema. */
+    ADC_Init(AN0_AN1_ANALOG);
+    I2C_Init_Master(I2C_100KHZ);
+    OLED_Init();
+    PWM_Init();
+
+    /** Inicializa el sensor ambiental BME280. */
+    bme_ok = BME280_Init();
+
+    /** Ciclo principal de adquisicion, control y visualizacion. */
+    while(1)
+    {
+        /** Lee el nivel de iluminacion mediante la LDR. */
+        luz_ADC = LDR_Leer();
+
+        /**
+         * Controla los LEDs segun el nivel de luz detectado.
+         * A menor iluminacion, se encienden mas LEDs.
+         */
+        if(luz_ADC < LUZ_BAJA)
+        {
+            LED_PIN  = ON;
+            LED2_PIN = ON;
+            LED3_PIN = ON;
+            LED4_PIN = ON;
+            LED5_PIN = ON;
+        }
+        else if (luz_ADC < LUZ_MEDIA)
+        {
+            LED_PIN  = ON;
+            LED2_PIN = ON;
+            LED3_PIN = ON;
+            LED4_PIN = ON;
+            LED5_PIN = OFF;
+        }
+        else if (luz_ADC < LUZ_MODERADA)
+        {
+            LED_PIN  = ON;
+            LED2_PIN = ON;
+            LED3_PIN = OFF;
+            LED4_PIN = OFF;
+            LED5_PIN = OFF;
+        }
+        else if(luz_ADC < LUZ_ALTA)
+        {
+            LED_PIN  = OFF;
+            LED2_PIN = OFF;
+            LED3_PIN = OFF;
+            LED4_PIN = OFF;
+            LED5_PIN = OFF;
+        }
+        else
+        {
+            LED_PIN  = OFF;
+            LED2_PIN = OFF;
+            LED3_PIN = OFF;
+            LED4_PIN = OFF;
+            LED5_PIN = OFF;
+        }
+
+        /** Lee temperatura y humedad desde el DHT11. */
+        dht_ok = DHT11_Read_Data(&temp, &hum_dht);
+
+        /** Si la lectura del DHT11 falla, marca la temperatura como error. */
+        if(!dht_ok)
+        {
+            temp = -1.0f;
+        }
+
+        /** Control del rele con histeresis para evitar conmutacion rapida. */
+        if(temp < TEMP_LOW) {
+            RELE_PIN = ON;
+        }
+        else if(temp > TEMP_HIGH) {
+            RELE_PIN = OFF;
+        }
+
+        /** Lee temperatura y humedad del BME280 si fue inicializado. */
+        if(bme_ok) {
+            humedad = leer_humedad();
+            temp_bme = BME280_ReadTemperature();
+        }
+        else{
+            humedad = -1.0f;
+            temp_bme = -1000.0f;
+        }
+
+        /** Lee el nivel de gas/contaminantes desde el MQ135. */
+        gas_val = MQ135_Leer();
+
+        /**
+         * Controla ventilacion por PWM y alarma sonora.
+         * El gas alto tiene prioridad sobre el control por humedad.
+         */
+        if(gas_val > 400)
+        {
+            PWM_SetDuty(100);
+            ALARMA_PIN = ON;
+        }
+        else if(humedad < 0.0f)
+        {
+            PWM_SetDuty(0);
+            ALARMA_PIN = OFF;
+        }
+        else if(humedad <= HUM_APAGADO)
+        {
+            PWM_SetDuty(0);
+            ALARMA_PIN = OFF;
+        }
+        else if(humedad >= HUM_ALTA)
+        {
+            PWM_SetDuty(30);
+            ALARMA_PIN = OFF;
+        }
+
+        /** Limpia la pantalla antes de escribir nuevos valores. */
+        OLED_ClearDisplay();
+
+        /** Escribe los encabezados de las secciones de la pantalla. */
+        OLED_SetFont(FONT_1);
+        OLED_Write_Text(0, 0, "DHT11");
+        OLED_Write_Text(50, 0, "LDR");
+        OLED_Write_Text(92, 0, "MQ135");
+        OLED_Write_Text(48, 42, "BME280");
+
+        /** Muestra la temperatura del DHT11 o un mensaje de error. */
+        OLED_Write_Text(0, 10, "Temp:");
+        if(temp < 0.0f)
+        {
+            OLED_Write_Text(0, 20, "ERR");
+        }
+        else
+        {
+            sprintf(txt_temp, "%.1f C", temp);
+            OLED_Write_Text(0, 20, txt_temp);
+        }
+
+        /** Muestra el valor ADC de luz. */
+        OLED_Write_Text(50, 10, "Luz:");
+        sprintf(txt_luz, "%u", luz_ADC);
+        OLED_Write_Text(50, 20, txt_luz);
+
+        /** Muestra el valor ADC del MQ135. */
+        OLED_Write_Text(92, 10, "Gas:");
+        sprintf(txt_gas, "%u", gas_val);
+        OLED_Write_Text(92, 20, txt_gas);
+
+        /** Indica si el nivel de gas supera el umbral definido. */
+        if(gas_val > 400)
+        {
+            OLED_Write_Text(92, 30, "ALTO");
+        }
+        else
+        {
+            OLED_Write_Text(92, 30, "OK");
+        }
+
+        /** Muestra la humedad medida por el BME280 o error. */
+        OLED_Write_Text(0, 53, "Hum:");
+        if(humedad < 0.0f){
+            OLED_Write_Text(25, 53, "ERR");
+        }
+        else{
+            sprintf(txt_hum, "%.1f%%", humedad);
+            OLED_Write_Text(25, 53, txt_hum);
+        }
+
+        /** Muestra la temperatura medida por el BME280 o error. */
+        OLED_Write_Text(80, 53, "T:");
+        if(temp_bme < -100.0f) {
+            OLED_Write_Text(92, 53, "ERR");
+        }
+        else {
+            sprintf(txt_temp, "%.1f C", temp_bme);
+            OLED_Write_Text(92, 53, txt_temp);
+        }
+
+        /** Envia el buffer grafico a la pantalla y espera antes de repetir. */
+        OLED_Update();
+        __delay_ms(1000);
+    }
+}
